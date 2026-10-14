@@ -185,6 +185,15 @@ impl Repo {
         self.mirrored().then_some("m")
     }
 
+    pub fn visibility(&self) -> Option<RepoVisibility> {
+        match self.api().and_then(|api| api.visibility.as_deref()) {
+            Some("public") => Some(RepoVisibility::Public),
+            Some("private") => Some(RepoVisibility::Private),
+            Some("internal") => Some(RepoVisibility::Internal),
+            _ => None,
+        }
+    }
+
     pub fn apply_summary(&mut self, api: ApiRepo) {
         if self.listed_clone.is_empty()
             && let Some(url) = api.clone_url.clone()
@@ -947,6 +956,13 @@ pub fn spans_from(lines: &[DetailLine]) -> Vec<DetailSpan> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoVisibility {
+    Public,
+    Private,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
     Header,
     Repo(usize),
@@ -1124,5 +1140,23 @@ mod tests {
                 .iter()
                 .any(|line| matches!(line, DetailLine::CommitsHeading))
         );
+    }
+
+    #[test]
+    fn visibility_reads_public_private_and_internal() {
+        let mut repo = repo("acme", "widget");
+        assert_eq!(repo.visibility(), None);
+        for (raw, kind) in [
+            ("public", RepoVisibility::Public),
+            ("private", RepoVisibility::Private),
+            ("internal", RepoVisibility::Internal),
+        ] {
+            repo.summary = Some(ApiRepo {
+                full_name: "acme/widget".to_string(),
+                visibility: Some(raw.to_string()),
+                ..ApiRepo::default()
+            });
+            assert_eq!(repo.visibility(), Some(kind));
+        }
     }
 }

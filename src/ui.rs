@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, Focus, Overlay, ToastKind};
 use crate::model::{
     Commit, DetailCursor, DetailLine, DetailSpan, EditKind, Field, FieldId, PullRequest,
-    VISIBILITIES, detail_lines, on_off, spans_from,
+    RepoVisibility, VISIBILITIES, detail_lines, on_off, spans_from,
 };
 use crate::origin::{create_preview, update_preview};
 use crate::screen::{FieldHit, Hits, Screen};
@@ -444,33 +444,30 @@ fn draw_list(
                 }
                 let repo = &app.repos[index];
                 let badge = repo.badge().unwrap_or("");
-                let reserve = if badge.is_empty() {
-                    1
+                let badge_w = UnicodeWidthStr::width(badge) as u16;
+                let right_limit = list_area.right().saturating_sub(1);
+                let name_end = if badge_w == 0 {
+                    right_limit
                 } else {
-                    2 + UnicodeWidthStr::width(badge)
+                    right_limit.saturating_sub(badge_w + 1)
                 };
-                let name_w = list_area.width.saturating_sub(2) as usize;
-                let name_w = name_w.saturating_sub(reserve);
+                let mark_x = list_area.x + 1;
+                let name_x = mark_x + 2;
+                if let Some(visibility) = repo.visibility() {
+                    let (glyph, style) = visibility_mark(theme, visibility);
+                    put(buf, mark_x, y, name_x, glyph, style);
+                }
                 let name_style = match (selected, repo.mirrored()) {
                     (true, true) => theme.fg(theme.mirror).add_modifier(Modifier::BOLD),
                     (true, false) => theme.bold_accent(),
                     (false, true) => theme.fg(theme.mirror),
                     (false, false) => theme.text(),
                 };
-                put(
-                    buf,
-                    list_area.x + 1,
-                    y,
-                    list_area.x + 1 + name_w as u16,
-                    &repo.name,
-                    name_style,
-                );
-                if !badge.is_empty() {
-                    let badge_w = UnicodeWidthStr::width(badge) as u16;
-                    let badge_x = list_area.right().saturating_sub(1 + badge_w);
+                put(buf, name_x, y, name_end, &repo.name, name_style);
+                if badge_w > 0 {
                     put(
                         buf,
-                        badge_x,
+                        right_limit.saturating_sub(badge_w),
                         y,
                         list_area.right(),
                         badge,
@@ -858,6 +855,14 @@ fn commit_tail(commit: &Commit) -> String {
     text
 }
 
+fn visibility_mark(theme: Theme, visibility: RepoVisibility) -> (&'static str, Style) {
+    match visibility {
+        RepoVisibility::Public => ("+", theme.fg(theme.ok)),
+        RepoVisibility::Private => ("·", theme.dim()),
+        RepoVisibility::Internal => ("~", theme.fg(theme.warn)),
+    }
+}
+
 fn pull_line(pull: &PullRequest) -> String {
     format!("#{}  {}  {}", pull.number, pull.status, pull.title)
 }
@@ -1044,6 +1049,7 @@ fn draw_help(frame: &mut Frame, theme: Theme, hits: &mut Hits) {
         ("Copy focused", "y    enter"),
         ("Copy web URL", "w"),
         ("Edit setting", "e"),
+        ("Visibility", "+ public  · private  ~ internal"),
         ("Select text", "drag"),
         ("Copy a value", "double-click"),
         ("Close this", "esc"),
@@ -1496,6 +1502,7 @@ mod tests {
         let left = list_line(&buf, "dotfiles");
         let left = left.split('│').next().unwrap_or(&left);
         assert!(left.trim_end().ends_with('m'), "{left}");
+        assert!(left.contains('·'), "{left}");
     }
 
     #[test]
@@ -1517,35 +1524,59 @@ mod tests {
         })
     }
 
+    fn name_pos(buf: &ratatui::buffer::Buffer, name: &str) -> Option<(u16, u16)> {
+        for y in 0..buf.area.height {
+            let line = selection::row_text(buf, y, 0, buf.area.width - 1);
+            if let Some(col) = token_at(&line, name) {
+                return Some((col as u16, y));
+            }
+        }
+        None
+    }
+
+    fn token_at(line: &str, name: &str) -> Option<usize> {
+        let chars: Vec<char> = line.chars().collect();
+        let needle: Vec<char> = name.chars().collect();
+        if needle.is_empty() || chars.len() < needle.len() {
+            return None;
+        }
+        for index in 0..=chars.len() - needle.len() {
+            if chars[index..index + needle.len()] != needle[..] {
+                continue;
+            }
+            let before = index == 0 || chars[index - 1].is_whitespace();
+            let after = index + needle.len();
+            if before && (after == chars.len() || chars[after].is_whitespace()) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
     fn list_line(buf: &ratatui::buffer::Buffer, name: &str) -> String {
-        (0..buf.area.height)
-            .map(|y| selection::row_text(buf, y, 0, buf.area.width - 1))
-            .find(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with(name)
-                    && trimmed
-                        .as_bytes()
-                        .get(name.len())
-                        .is_none_or(|byte| byte.is_ascii_whitespace())
-            })
+        name_pos(buf, name)
+            .map(|(_, y)| selection::row_text(buf, y, 0, buf.area.width - 1))
             .unwrap_or_default()
     }
 
     fn name_fg(buf: &ratatui::buffer::Buffer, name: &str) -> Option<ratatui::style::Color> {
-        for y in 0..buf.area.height {
-            let line = selection::row_text(buf, y, 0, buf.area.width - 1);
-            let trimmed = line.trim_start();
-            if trimmed.starts_with(name)
-                && trimmed
-                    .as_bytes()
-                    .get(name.len())
-                    .is_none_or(|byte| byte.is_ascii_whitespace())
-            {
-                let x = (line.len() - trimmed.len()) as u16;
-                return buf[(x, y)].style().fg;
-            }
+        name_pos(buf, name).and_then(|(x, y)| buf[(x, y)].style().fg)
+    }
+
+    fn visibility_glyph(
+        buf: &ratatui::buffer::Buffer,
+        name: &str,
+    ) -> Option<(char, ratatui::style::Color)> {
+        let (x, y) = name_pos(buf, name)?;
+        if x < 2 {
+            return None;
         }
-        None
+        let cell = &buf[(x - 2, y)];
+        let glyph = cell.symbol().chars().next()?;
+        if glyph.is_whitespace() {
+            return None;
+        }
+        Some((glyph, cell.style().fg?))
     }
 
     #[test]
@@ -1656,5 +1687,40 @@ mod tests {
         assert!(!text.contains("branches"), "{text}");
         assert!(screen.hits.branch_rows.is_empty());
         assert_eq!(screen.hits.commit_rows.len(), 1);
+    }
+
+    fn listed(name: &str, visibility: Option<&str>) -> Repo {
+        let mut repo = native(name);
+        if let Some(visibility) = visibility {
+            repo.apply_summary(ApiRepo {
+                full_name: format!("splaice/{name}"),
+                visibility: Some(visibility.to_string()),
+                ..ApiRepo::default()
+            });
+        }
+        repo
+    }
+
+    #[test]
+    fn list_marks_public_private_and_internal() {
+        let app = app_with(vec![
+            listed("open", Some("public")),
+            listed("closed", Some("private")),
+            listed("shared", Some("internal")),
+            listed("loading", None),
+        ]);
+        let (buf, _) = render(&app, 110, 32);
+        let theme = Theme::grok_night();
+        assert_eq!(visibility_glyph(&buf, "open"), Some(('+', theme.ok)));
+        assert_eq!(visibility_glyph(&buf, "closed"), Some(('·', theme.dim)));
+        assert_eq!(visibility_glyph(&buf, "shared"), Some(('~', theme.warn)));
+        assert_eq!(visibility_glyph(&buf, "loading"), None);
+        let open = name_pos(&buf, "open").unwrap().0;
+        let closed = name_pos(&buf, "closed").unwrap().0;
+        let shared = name_pos(&buf, "shared").unwrap().0;
+        let loading = name_pos(&buf, "loading").unwrap().0;
+        assert_eq!(open, closed);
+        assert_eq!(closed, shared);
+        assert_eq!(shared, loading);
     }
 }
