@@ -1,0 +1,16 @@
+[package]
+name = "origin-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+unicode-width = "0.2.2"
+
+[[bin]]
+name = "ot"
+path = "src/main.rs"
