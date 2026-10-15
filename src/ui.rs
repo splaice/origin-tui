@@ -6,14 +6,19 @@ use ratatui::widgets::{Block, Borders, Clear};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Overlay, ToastKind};
+use crate::github::{self, SYNC_NOTE};
+use crate::markdown::{self, Mark};
 use crate::model::{
-    Commit, DetailCursor, DetailLine, DetailSpan, EditKind, Field, FieldId, PullRequest,
-    RepoVisibility, VISIBILITIES, detail_lines, on_off, spans_from,
+    Commit, DetailCursor, DetailLine, DetailSpan, EditKind, Field, FieldId, GITHUB_VISIBILITIES,
+    PullRequest, RepoVisibility, VISIBILITIES, detail_lines, on_off, spans_from,
 };
-use crate::origin::{create_preview, update_preview};
+use crate::origin::{
+    create_preview, delete_branch_preview, delete_preview, mirror_preview, mirrored_full_name,
+    update_preview,
+};
 use crate::screen::{FieldHit, Hits, Screen};
 use crate::selection;
-use crate::text::{fit, format_time, wrap_parts};
+use crate::text::{display_width, fit, format_time, wrap_parts};
 use crate::theme::Theme;
 
 const HEADER_H: u16 = 4;
@@ -28,6 +33,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> Screen {
         match overlay {
             Overlay::Help => draw_help(frame, theme, &mut screen.hits),
             Overlay::Create(form) => draw_create(frame, form, theme, &mut screen.hits),
+            Overlay::Mirror(form) => draw_mirror(frame, form, theme, &mut screen.hits),
+            Overlay::GithubChild(form) => draw_github_child(frame, form, theme, &mut screen.hits),
+            Overlay::Delete(form) => draw_delete(frame, form, theme, &mut screen.hits),
+            Overlay::DeleteBranch(form) => draw_delete_branch(frame, form, theme, &mut screen.hits),
+            Overlay::Readme(view) => draw_readme(frame, view, theme, &mut screen),
             Overlay::Edit(form) => draw_edit(frame, form, theme, &mut screen.hits),
         }
     }
@@ -127,6 +137,8 @@ fn paint_main(frame: &mut Frame, app: &App, theme: Theme) -> Option<(Screen, Rec
             list_height: list_area.height as usize,
             list_offset,
             spans,
+            readme_rows: 0,
+            readme_height: 0,
         },
         filter_area,
     ))
@@ -310,6 +322,68 @@ fn draw_repo_header(
         width: web_label.right().saturating_sub(web_key.x).max(1),
         height: 1,
     });
+    let mirror_x = web_label.right().saturating_add(3);
+    let mirror_key = put(buf, mirror_x, y, max_x, "m", theme.bold_accent());
+    let mirror_label = put(
+        buf,
+        mirror_key.right() + 1,
+        y,
+        max_x,
+        "mirror",
+        theme.text(),
+    );
+    hits.mirror = Some(Rect {
+        x: mirror_key.x,
+        y,
+        width: mirror_label.right().saturating_sub(mirror_key.x).max(1),
+        height: 1,
+    });
+    let sync_x = mirror_label.right().saturating_add(3);
+    let actions_right = if sync_x + 6 < max_x {
+        let sync_key = put(buf, sync_x, y, max_x, "s", theme.bold_accent());
+        let sync_label = put(buf, sync_key.right() + 1, y, max_x, "sync", theme.text());
+        hits.sync = Some(Rect {
+            x: sync_key.x,
+            y,
+            width: sync_label.right().saturating_sub(sync_key.x).max(1),
+            height: 1,
+        });
+        sync_label.right()
+    } else {
+        mirror_label.right()
+    };
+    let actions_right = if hits.sync.is_some() {
+        let delete_x = actions_right.saturating_add(3);
+        if delete_x + 8 < max_x {
+            let delete_key = put(
+                buf,
+                delete_x,
+                y,
+                max_x,
+                "d",
+                theme.fg(theme.danger).add_modifier(Modifier::BOLD),
+            );
+            let delete_label = put(
+                buf,
+                delete_key.right() + 1,
+                y,
+                max_x,
+                "delete",
+                theme.fg(theme.danger),
+            );
+            hits.delete = Some(Rect {
+                x: delete_key.x,
+                y,
+                width: delete_label.right().saturating_sub(delete_key.x).max(1),
+                height: 1,
+            });
+            delete_label.right()
+        } else {
+            actions_right
+        }
+    } else {
+        actions_right
+    };
     if app.detail_inflight
         && app
             .selected_repo()
@@ -320,7 +394,7 @@ fn draw_repo_header(
         let note_x = area
             .right()
             .saturating_sub(1 + UnicodeWidthStr::width(note) as u16);
-        if note_x > web_label.right() + 1 {
+        if note_x > actions_right + 1 {
             put(buf, note_x, y, max_x, note, theme.faint());
         }
     }
@@ -598,13 +672,17 @@ fn draw_detail(
                         );
                     }
                     if *part == 0 {
-                        let label_style = if selected && field.id.editable() {
-                            theme.accent()
-                        } else if selected {
-                            theme.text()
-                        } else {
-                            theme.dim()
-                        };
+                        let mut label_style =
+                            if selected && (field.id.editable() || field.id == FieldId::Readme) {
+                                theme.accent()
+                            } else if selected {
+                                theme.text()
+                            } else {
+                                theme.dim()
+                            };
+                        if selected && field.id == FieldId::Readme {
+                            label_style = label_style.bg(theme.bg_selected);
+                        }
                         put(buf, label_x, y, label_x + LABEL_W, field.label, label_style);
                     } else if (y as usize) < continues.len() {
                         continues[y as usize] = Some(value_x);
@@ -617,6 +695,17 @@ fn draw_detail(
                         text,
                         field_style(theme, field, selected),
                     );
+                    if field.id == FieldId::Readme && *part == 0 && !field.display.contains(' ') {
+                        let hint = "view";
+                        let hint_x = max_x.saturating_sub(display_width(hint) as u16);
+                        if hint_x > rect.right().saturating_add(2) {
+                            let mut hint_style = theme.faint();
+                            if selected {
+                                hint_style = hint_style.bg(theme.bg_selected);
+                            }
+                            put(buf, hint_x, y, max_x, hint, hint_style);
+                        }
+                    }
                     if rect.width > 0 {
                         hits.fields.push(FieldHit { id: field.id, rect });
                     }
@@ -624,7 +713,14 @@ fn draw_detail(
             }
             DetailLine::Gap => {}
             DetailLine::BranchesHeading => {
-                put(buf, area.x + 1, y, max_x, "branches", theme.faint());
+                let label = put(buf, area.x + 1, y, max_x, "branches", theme.faint());
+                if !repo.mirrored() {
+                    let hint = "x delete";
+                    let hint_x = max_x.saturating_sub(display_width(hint) as u16);
+                    if hint_x > label.right().saturating_add(2) {
+                        put(buf, hint_x, y, max_x, hint, theme.faint());
+                    }
+                }
             }
             DetailLine::BranchesLoading => {
                 put(buf, area.x + 1, y, max_x, "Loading branches…", theme.dim());
@@ -887,7 +983,10 @@ fn field_style(theme: Theme, field: &Field, selected: bool) -> Style {
             theme.fg(theme.ok)
         }
         FieldId::MergeCommit | FieldId::Squash | FieldId::DeleteBranch => theme.dim(),
-        FieldId::Clone | FieldId::Web if !selected => theme.text(),
+        FieldId::Clone | FieldId::Web | FieldId::GithubChild if !selected => theme.text(),
+        FieldId::Readme if field.display.contains(' ') => theme.fg(theme.danger),
+        FieldId::Readme if selected => theme.accent().bg(theme.bg_selected),
+        FieldId::Readme => theme.accent(),
         _ if selected => theme.text(),
         _ => theme.text(),
     }
@@ -944,6 +1043,43 @@ fn draw_hints(
             ("q", true),
             (" quit", false),
         ],
+        (Some(Overlay::Mirror(_)), _) => &[
+            ("tab", true),
+            (" field", false),
+            ("   ", false),
+            ("enter", true),
+            (" mirror", false),
+            ("   ", false),
+            ("esc", true),
+            (" cancel", false),
+        ],
+        (Some(Overlay::GithubChild(_)), _) => &[
+            ("tab", true),
+            (" field", false),
+            ("   ", false),
+            ("enter", true),
+            (" sync", false),
+            ("   ", false),
+            ("esc", true),
+            (" cancel", false),
+        ],
+        (Some(Overlay::Readme(_)), _) => &[
+            ("↑↓", true),
+            (" scroll", false),
+            ("   ", false),
+            ("y", true),
+            (" copy", false),
+            ("   ", false),
+            ("esc", true),
+            (" close", false),
+        ],
+        (Some(Overlay::Delete(_) | Overlay::DeleteBranch(_)), _) => &[
+            ("enter", true),
+            (" delete", false),
+            ("   ", false),
+            ("esc", true),
+            (" cancel", false),
+        ],
         (Some(Overlay::Create(_)), _) => &[
             ("tab", true),
             (" field", false),
@@ -966,6 +1102,43 @@ fn draw_hints(
             ("   ", false),
             ("esc", true),
             (" clear", false),
+        ],
+        (_, Focus::Detail)
+            if matches!(app.cursor, DetailCursor::Field)
+                && app.selected_field == FieldId::Readme =>
+        {
+            &[
+                ("↑↓", true),
+                (" row", false),
+                ("   ", false),
+                ("enter", true),
+                (" view", false),
+                ("   ", false),
+                ("y", true),
+                (" copy", false),
+                ("   ", false),
+                ("tab", true),
+                (" list", false),
+                ("   ", false),
+                ("?", true),
+                (" help", false),
+            ]
+        }
+        (_, Focus::Detail) if matches!(app.cursor, DetailCursor::Branch(_)) => &[
+            ("↑↓", true),
+            (" row", false),
+            ("   ", false),
+            ("x", true),
+            (" delete", false),
+            ("   ", false),
+            ("y", true),
+            (" copy", false),
+            ("   ", false),
+            ("tab", true),
+            (" list", false),
+            ("   ", false),
+            ("?", true),
+            (" help", false),
         ],
         (_, Focus::Detail) => &[
             ("↑↓", true),
@@ -1026,7 +1199,7 @@ fn draw_hints(
 }
 
 fn draw_help(frame: &mut Frame, theme: Theme, hits: &mut Hits) {
-    let area = centered(frame.area(), 56, 18);
+    let area = centered(frame.area(), 56, 23);
     hits.modal = Some(area);
     let block = Block::default()
         .title(Line::from(Span::styled(" Keys ", theme.bold_accent())))
@@ -1045,8 +1218,13 @@ fn draw_help(frame: &mut Frame, theme: Theme, hits: &mut Hits) {
         ("Panes", "tab    ← →"),
         ("Filter", "/"),
         ("New repository", "n"),
+        ("Mirror GitHub", "m"),
+        ("Sync to GitHub", "s"),
+        ("Delete repository", "d"),
+        ("Delete branch", "x"),
         ("Refresh", "r"),
         ("Copy focused", "y    enter"),
+        ("View README", "enter"),
         ("Copy web URL", "w"),
         ("Edit setting", "e"),
         ("Visibility", "+ public  · private  ~ internal"),
@@ -1069,6 +1247,677 @@ fn draw_help(frame: &mut Frame, theme: Theme, hits: &mut Hits) {
             keys,
             theme.text(),
         );
+    }
+}
+
+fn draw_mirror(frame: &mut Frame, form: &crate::model::MirrorForm, theme: Theme, hits: &mut Hits) {
+    let area = centered(frame.area(), 68, 16);
+    hits.modal = Some(area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Mirror from GitHub ",
+            theme.bold_accent(),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.fg(theme.accent))
+        .style(Style::new().bg(theme.bg_raised).fg(theme.text));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let cursor = {
+        let buf = frame.buffer_mut();
+        fill(buf, inner, theme.bg_raised, theme.text);
+        let fields = [
+            ("GitHub repository", &form.github, form.focus == 0),
+            ("Namespace", &form.namespace, form.focus == 1),
+        ];
+        let mut y = inner.y;
+        let mut cursor = None;
+        let max_x = inner.right().saturating_sub(1);
+        for (label, editor, focused) in fields {
+            if y + 1 >= inner.bottom() {
+                break;
+            }
+            put(buf, inner.x + 1, y, max_x, label, theme.dim());
+            y += 1;
+            let row = Rect {
+                x: inner.x + 1,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            fill(
+                buf,
+                row,
+                if focused {
+                    theme.bg_selected
+                } else {
+                    theme.bg_field
+                },
+                theme.text,
+            );
+            let room = row.width.saturating_sub(1) as usize;
+            let (visible, col) = editor.window(room);
+            put(buf, row.x + 1, y, row.right(), &visible, theme.text());
+            hits.modal_inputs.push(row);
+            if focused && !form.busy {
+                let cursor_x = row.x + 1 + col as u16;
+                if cursor_x < row.right() {
+                    cursor = Some((cursor_x, y));
+                }
+            }
+            y = y.saturating_add(2);
+        }
+        let github = form.github.value.trim();
+        let namespace = form.namespace.value.trim();
+        let created = mirrored_full_name(github, namespace);
+        let note = if form.busy {
+            "Creating the mirror…".to_string()
+        } else if github.contains('/') {
+            format!("Creates {created}. GitHub stays the source of truth.")
+        } else {
+            "GitHub stays the source of truth.".to_string()
+        };
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &fit(&note, inner.width.saturating_sub(2) as usize),
+                theme.dim(),
+            );
+            y += 1;
+        }
+        let preview = mirror_preview(github, namespace);
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &fit(&preview, inner.width.saturating_sub(2) as usize),
+                theme.faint(),
+            );
+            y += 1;
+        }
+        if let Some(err) = &form.error
+            && y < inner.bottom()
+        {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &fit(err, inner.width.saturating_sub(2) as usize),
+                theme.fg(theme.danger),
+            );
+        }
+        cursor
+    };
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn draw_github_child(
+    frame: &mut Frame,
+    form: &crate::model::GithubChildForm,
+    theme: Theme,
+    hits: &mut Hits,
+) {
+    let area = centered(frame.area(), 74, 20);
+    hits.modal = Some(area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Sync to GitHub ",
+            theme.bold_accent(),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.fg(theme.accent))
+        .style(Style::new().bg(theme.bg_raised).fg(theme.text));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let cursor = {
+        let buf = frame.buffer_mut();
+        fill(buf, inner, theme.bg_raised, theme.text);
+        let mut y = inner.y;
+        let mut cursor = None;
+        let max_x = inner.right().saturating_sub(1);
+        if y + 1 < inner.bottom() {
+            put(buf, inner.x + 1, y, max_x, "GitHub repository", theme.dim());
+            y += 1;
+            let row = Rect {
+                x: inner.x + 1,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            let focused = form.focus == 0;
+            fill(
+                buf,
+                row,
+                if focused {
+                    theme.bg_selected
+                } else {
+                    theme.bg_field
+                },
+                theme.text,
+            );
+            let room = row.width.saturating_sub(1) as usize;
+            let (visible, col) = form.github.window(room);
+            put(buf, row.x + 1, y, row.right(), &visible, theme.text());
+            hits.modal_inputs.push(row);
+            if focused && !form.busy {
+                let cursor_x = row.x + 1 + col as u16;
+                if cursor_x < row.right() {
+                    cursor = Some((cursor_x, y));
+                }
+            }
+            y = y.saturating_add(2);
+        }
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                "Visibility on create",
+                theme.dim(),
+            );
+            y += 1;
+        }
+        for (index, name) in GITHUB_VISIBILITIES.iter().enumerate() {
+            if y >= inner.bottom() {
+                break;
+            }
+            let row = Rect {
+                x: inner.x + 1,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            let selected = form.visibility == index;
+            fill(
+                buf,
+                row,
+                if selected {
+                    theme.bg_selected
+                } else {
+                    theme.bg_field
+                },
+                theme.text,
+            );
+            let style = if selected {
+                theme.accent()
+            } else {
+                theme.text()
+            };
+            put(buf, row.x + 1, y, row.right(), name, style);
+            hits.modal_inputs.push(row);
+            y += 1;
+        }
+        y = y.saturating_add(1);
+        let note = if form.busy {
+            "Syncing to GitHub…".to_string()
+        } else {
+            SYNC_NOTE.to_string()
+        };
+        if y < inner.bottom() {
+            y = write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                &note,
+                theme.dim(),
+            );
+            y = y.saturating_add(1);
+        }
+        let preview =
+            github::sync_preview(form.github.value.trim(), visibility_name(form.visibility));
+        if y < inner.bottom() {
+            y = write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                &preview,
+                theme.faint(),
+            );
+            y = y.saturating_add(1);
+        }
+        if let Some(err) = &form.error
+            && y < inner.bottom()
+        {
+            write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                err,
+                theme.fg(theme.danger),
+            );
+        }
+        cursor
+    };
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn visibility_name(index: usize) -> &'static str {
+    GITHUB_VISIBILITIES
+        .get(index)
+        .copied()
+        .unwrap_or(GITHUB_VISIBILITIES[0])
+}
+
+fn write_lines(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    mut y: u16,
+    max_x: u16,
+    bottom: u16,
+    text: &str,
+    style: Style,
+) -> u16 {
+    let width = max_x.saturating_sub(x) as usize;
+    if width == 0 {
+        return y;
+    }
+    for part in wrap_words(text, width) {
+        if y >= bottom {
+            break;
+        }
+        put(buf, x, y, max_x, &part, style);
+        y += 1;
+    }
+    y
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let word_w = display_width(word);
+        if word_w > width {
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                col = 0;
+            }
+            let mut parts = wrap_parts(word, width);
+            if let Some(last) = parts.pop() {
+                lines.extend(parts);
+                col = display_width(&last);
+                line = last;
+            }
+            continue;
+        }
+        let gap = usize::from(!line.is_empty());
+        if col + gap + word_w > width {
+            lines.push(std::mem::take(&mut line));
+            col = 0;
+        } else if gap == 1 {
+            line.push(' ');
+            col += 1;
+        }
+        line.push_str(word);
+        col += word_w;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+fn draw_delete(frame: &mut Frame, form: &crate::model::DeleteForm, theme: Theme, hits: &mut Hits) {
+    let area = centered(frame.area(), 68, 16);
+    hits.modal = Some(area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Delete repository ",
+            theme.fg(theme.danger).add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.fg(theme.danger))
+        .style(Style::new().bg(theme.bg_raised).fg(theme.text));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let cursor = {
+        let buf = frame.buffer_mut();
+        fill(buf, inner, theme.bg_raised, theme.text);
+        let mut y = inner.y;
+        let mut cursor = None;
+        let max_x = inner.right().saturating_sub(1);
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &form.full_name,
+                theme.fg(theme.danger).add_modifier(Modifier::BOLD),
+            );
+            y = y.saturating_add(2);
+        }
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                "Type the repository name to confirm.",
+                theme.dim(),
+            );
+            y += 1;
+        }
+        if y < inner.bottom() {
+            let row = Rect {
+                x: inner.x + 1,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            fill(buf, row, theme.bg_selected, theme.text);
+            let room = row.width.saturating_sub(1) as usize;
+            let (visible, col) = form.confirm.window(room);
+            put(buf, row.x + 1, y, row.right(), &visible, theme.text());
+            hits.modal_inputs.push(row);
+            if !form.busy {
+                let cursor_x = row.x + 1 + col as u16;
+                if cursor_x < row.right() {
+                    cursor = Some((cursor_x, y));
+                }
+            }
+            y = y.saturating_add(2);
+        }
+        let note = if form.busy {
+            "Deleting the repository…".to_string()
+        } else if form.mirrored {
+            "This permanently deletes the Origin repository. The GitHub repository it mirrors is left as-is.".to_string()
+        } else {
+            "This permanently deletes the Origin repository.".to_string()
+        };
+        if y < inner.bottom() {
+            y = write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                &note,
+                theme.dim(),
+            );
+            y = y.saturating_add(1);
+        }
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &fit(
+                    &delete_preview(&form.full_name),
+                    inner.width.saturating_sub(2) as usize,
+                ),
+                theme.faint(),
+            );
+            y += 1;
+        }
+        if let Some(err) = &form.error
+            && y < inner.bottom()
+        {
+            write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                err,
+                theme.fg(theme.danger),
+            );
+        }
+        cursor
+    };
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
+    }
+}
+
+fn draw_readme(
+    frame: &mut Frame,
+    view: &crate::model::ReadmeView,
+    theme: Theme,
+    screen: &mut Screen,
+) {
+    let outer = frame.area();
+    let area = centered(
+        outer,
+        outer.width.saturating_sub(4).max(24),
+        outer.height.saturating_sub(2).max(8),
+    );
+    screen.hits.modal = Some(area);
+    let title = format!(" {} ", view.path);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            title,
+            theme.fg(theme.accent).add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.fg(theme.accent))
+        .style(Style::new().bg(theme.bg_raised).fg(theme.text));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let buf = frame.buffer_mut();
+    fill(buf, inner, theme.bg_raised, theme.text);
+    let max_x = inner.right().saturating_sub(1);
+    let width = max_x.saturating_sub(inner.x + 1) as usize;
+    let mut y = inner.y;
+    if y < inner.bottom() {
+        put(buf, inner.x + 1, y, max_x, &view.full_name, theme.dim());
+        y += 1;
+    }
+    let body_top = y;
+    let body_height = inner.bottom().saturating_sub(body_top) as usize;
+    let lines = markdown::render(&view.text, width);
+    screen.readme_rows = lines.len();
+    screen.readme_height = body_height;
+    let max_scroll = lines.len().saturating_sub(body_height);
+    let scroll = view.scroll.min(max_scroll);
+    for line in lines.iter().skip(scroll).take(body_height) {
+        if y >= inner.bottom() {
+            break;
+        }
+        draw_md_row(buf, inner.x + 1, y, max_x, line, theme);
+        y += 1;
+    }
+}
+
+fn draw_md_row(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    max_x: u16,
+    row: &markdown::Row,
+    theme: Theme,
+) {
+    if row.band {
+        let width = max_x.saturating_sub(x);
+        if width > 0 && y < buf.area.height {
+            fill(
+                buf,
+                Rect {
+                    x,
+                    y,
+                    width,
+                    height: 1,
+                },
+                theme.bg_field,
+                theme.text,
+            );
+        }
+    }
+    let mut cursor = x;
+    for piece in &row.pieces {
+        if piece.text.is_empty() || piece.text == "\n" || cursor >= max_x {
+            continue;
+        }
+        let mut style = md_style(theme, piece.mark);
+        if row.band {
+            style = style.bg(theme.bg_field);
+        }
+        let rect = put(buf, cursor, y, max_x, &piece.text, style);
+        if rect.width == 0 {
+            break;
+        }
+        cursor = rect.right();
+    }
+}
+
+fn md_style(theme: Theme, mark: Mark) -> Style {
+    match mark {
+        Mark::Body | Mark::CodeBlock => theme.text(),
+        Mark::Strong => theme.bold(),
+        Mark::Emphasis => theme.text().add_modifier(Modifier::ITALIC),
+        Mark::StrongEmphasis => theme.bold().add_modifier(Modifier::ITALIC),
+        Mark::Code => theme.fg(theme.mirror).bg(theme.bg_field),
+        Mark::H1 => theme.bold_accent(),
+        Mark::H2 => theme.bold(),
+        Mark::H3 => theme.accent(),
+        Mark::Link => theme.accent().add_modifier(Modifier::UNDERLINED),
+        Mark::Dim => theme.dim(),
+        Mark::Strike => theme.dim().add_modifier(Modifier::CROSSED_OUT),
+        Mark::Rule => theme.fg(theme.border),
+    }
+}
+
+fn draw_delete_branch(
+    frame: &mut Frame,
+    form: &crate::model::DeleteBranchForm,
+    theme: Theme,
+    hits: &mut Hits,
+) {
+    let area = centered(frame.area(), 72, 17);
+    hits.modal = Some(area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Delete branch ",
+            theme.fg(theme.danger).add_modifier(Modifier::BOLD),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.fg(theme.danger))
+        .style(Style::new().bg(theme.bg_raised).fg(theme.text));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let cursor = {
+        let buf = frame.buffer_mut();
+        fill(buf, inner, theme.bg_raised, theme.text);
+        let mut y = inner.y;
+        let mut cursor = None;
+        let max_x = inner.right().saturating_sub(1);
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &form.branch,
+                theme.fg(theme.danger).add_modifier(Modifier::BOLD),
+            );
+            y += 1;
+        }
+        if y < inner.bottom() {
+            put(buf, inner.x + 1, y, max_x, &form.full_name, theme.dim());
+            y = y.saturating_add(2);
+        }
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                "Type the branch name to confirm.",
+                theme.dim(),
+            );
+            y += 1;
+        }
+        if y < inner.bottom() {
+            let row = Rect {
+                x: inner.x + 1,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            };
+            fill(buf, row, theme.bg_selected, theme.text);
+            let room = row.width.saturating_sub(1) as usize;
+            let (visible, col) = form.confirm.window(room);
+            put(buf, row.x + 1, y, row.right(), &visible, theme.text());
+            hits.modal_inputs.push(row);
+            if !form.busy {
+                let cursor_x = row.x + 1 + col as u16;
+                if cursor_x < row.right() {
+                    cursor = Some((cursor_x, y));
+                }
+            }
+            y = y.saturating_add(2);
+        }
+        let note = if form.busy {
+            "Deleting the branch…".to_string()
+        } else {
+            "This permanently deletes the branch on Origin. Pull requests from this branch are closed.".to_string()
+        };
+        if y < inner.bottom() {
+            y = write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                &note,
+                theme.dim(),
+            );
+            y = y.saturating_add(1);
+        }
+        if y < inner.bottom() {
+            put(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                &fit(
+                    &delete_branch_preview(&form.full_name, &form.branch),
+                    inner.width.saturating_sub(2) as usize,
+                ),
+                theme.faint(),
+            );
+            y += 1;
+        }
+        if let Some(err) = &form.error
+            && y < inner.bottom()
+        {
+            write_lines(
+                buf,
+                inner.x + 1,
+                y,
+                max_x,
+                inner.bottom(),
+                err,
+                theme.fg(theme.danger),
+            );
+        }
+        cursor
+    };
+    if let Some(position) = cursor {
+        frame.set_cursor_position(position);
     }
 }
 
@@ -1488,21 +2337,154 @@ mod tests {
         out
     }
 
+    fn style_of(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<Style> {
+        for y in 0..buf.area.height {
+            let row = selection::row_text(buf, y, 0, buf.area.width - 1);
+            if let Some(index) = row.find(needle) {
+                let col = display_width(&row[..index]) as u16;
+                return Some(buf[(col, y)].style());
+            }
+        }
+        None
+    }
+
     #[test]
     fn layout_shows_account_repo_and_actions() {
         let app = app_with(vec![mirrored("dotfiles"), mirrored("garage")]);
-        let (buf, _) = render(&app, 110, 32);
+        let (buf, screen) = render(&app, 110, 32);
         let text = plain(&buf);
         assert!(text.contains("splaice@gmail.com"), "{text}");
         assert!(text.contains("dotfiles"), "{text}");
         assert!(text.contains("copy clone"), "{text}");
         assert!(text.contains("copy web"), "{text}");
+        assert!(screen.hits.mirror.is_some(), "{text}");
+        assert!(screen.hits.sync.is_some(), "{text}");
+        assert!(screen.hits.delete.is_some(), "{text}");
+        assert!(text.contains("sync"), "{text}");
         assert!(text.contains("new repo"), "{text}");
         assert!(text.contains("private"), "{text}");
         let left = list_line(&buf, "dotfiles");
         let left = left.split('│').next().unwrap_or(&left);
         assert!(left.trim_end().ends_with('m'), "{left}");
         assert!(left.contains('·'), "{left}");
+    }
+
+    #[test]
+    fn help_lists_sync_to_github() {
+        let mut app = app_with(vec![native("garage")]);
+        app.overlay = Some(Overlay::Help);
+        let (buf, _) = render(&app, 110, 36);
+        let text = plain(&buf);
+        assert!(text.contains("Sync to GitHub"), "{text}");
+        assert!(text.contains("Delete repository"), "{text}");
+        assert!(text.contains("Delete branch"), "{text}");
+        assert!(text.contains("View README"), "{text}");
+        assert!(text.contains("Mirror GitHub"), "{text}");
+    }
+
+    #[test]
+    fn branch_heading_offers_delete() {
+        let mut repo = native("widget");
+        repo.branches = vec![
+            crate::model::Branch {
+                name: "main".to_string(),
+                sha: "a".repeat(40),
+            },
+            crate::model::Branch {
+                name: "topic/one".to_string(),
+                sha: "b".repeat(40),
+            },
+        ];
+        let app = app_with(vec![repo]);
+        let (buf, _) = render(&app, 110, 48);
+        let text = plain(&buf);
+        assert!(text.contains("topic/one"), "{text}");
+        assert!(text.contains("x delete"), "{text}");
+    }
+
+    #[test]
+    fn readme_row_offers_a_view() {
+        let mut repo = native("widget");
+        repo.readme = Some(crate::model::Readme {
+            path: "README.md".to_string(),
+            text: "# Hello\nfrom the repo".to_string(),
+        });
+        let app = app_with(vec![repo]);
+        let (buf, _) = render(&app, 110, 32);
+        let text = plain(&buf);
+        assert!(text.contains("readme"), "{text}");
+        assert!(text.contains("README.md"), "{text}");
+        assert!(text.contains("view"), "{text}");
+    }
+
+    #[test]
+    fn readme_view_shows_the_file() {
+        let mut app = app_with(vec![native("widget")]);
+        app.overlay = Some(Overlay::Readme(crate::model::ReadmeView {
+            full_name: "acme/widget".to_string(),
+            path: "README.md".to_string(),
+            text: "# Hello\n\nfrom the **alpha** repo with `snippet`.".to_string(),
+            scroll: 0,
+        }));
+        let (buf, _) = render(&app, 80, 24);
+        let text = plain(&buf);
+        assert!(text.contains("acme/widget"), "{text}");
+        assert!(text.contains("Hello"), "{text}");
+        assert!(!text.contains("# Hello"), "{text}");
+        assert!(text.contains("from the alpha repo"), "{text}");
+        assert!(!text.contains("**"), "{text}");
+        assert!(text.contains("snippet"), "{text}");
+        assert!(!text.contains('`'), "{text}");
+        let theme = Theme::grok_night();
+        let hello = style_of(&buf, "Hello").expect("heading");
+        assert_eq!(hello.fg, Some(theme.accent));
+        assert!(hello.add_modifier.contains(Modifier::BOLD));
+        let alpha = style_of(&buf, "alpha").expect("strong");
+        assert_eq!(alpha.fg, Some(theme.text));
+        assert!(alpha.add_modifier.contains(Modifier::BOLD));
+        let snippet = style_of(&buf, "snippet").expect("code");
+        assert_eq!(snippet.fg, Some(theme.mirror));
+        assert_eq!(snippet.bg, Some(theme.bg_field));
+    }
+
+    #[test]
+    fn delete_branch_dialog_names_the_branch() {
+        let mut app = app_with(vec![native("widget")]);
+        app.overlay = Some(Overlay::DeleteBranch(crate::model::DeleteBranchForm {
+            full_name: "acme/widget".to_string(),
+            branch: "topic/one".to_string(),
+            confirm: crate::model::Editor::new(""),
+            error: None,
+            busy: false,
+            generation: 1,
+        }));
+        let (buf, _) = render(&app, 110, 40);
+        let text = plain(&buf);
+        assert!(text.contains("topic/one"), "{text}");
+        assert!(text.contains("Type the branch name"), "{text}");
+        assert!(text.contains("Pull requests from"), "{text}");
+        assert!(text.contains("this branch are closed."), "{text}");
+        assert!(text.contains("git/refs/heads/topic%2Fone"), "{text}");
+    }
+
+    #[test]
+    fn sync_dialog_says_origin_is_the_source() {
+        let mut app = app_with(vec![native("widget")]);
+        app.overlay = Some(Overlay::GithubChild(crate::model::GithubChildForm {
+            github: crate::model::Editor::new("acme/widget"),
+            visibility: 0,
+            focus: 0,
+            error: None,
+            busy: false,
+            generation: 1,
+        }));
+        let (buf, _) = render(&app, 110, 36);
+        let text = plain(&buf);
+        assert!(text.contains("Origin is the source"), "{text}");
+        assert!(text.contains("tags that exist only on GitHub"), "{text}");
+        assert!(text.contains("git push --mirror"), "{text}");
+        assert!(text.contains("private"), "{text}");
+        assert!(!text.contains("add-readme"), "{text}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::app::{Job, Msg};
+use crate::github;
 use crate::origin;
 
 pub fn execute(bin: &Path, job: Job) -> Msg {
@@ -52,6 +53,19 @@ pub fn execute(bin: &Path, job: Job) -> Msg {
                 result,
             }
         }
+        Job::Readme {
+            full_name,
+            branch,
+            generation,
+        } => {
+            let result = origin::fetch_readme(bin, &full_name, &branch);
+            Msg::Readme {
+                generation,
+                full_name,
+                branch,
+                result,
+            }
+        }
         Job::Pulls {
             full_name,
             generation,
@@ -92,5 +106,44 @@ pub fn execute(bin: &Path, job: Job) -> Msg {
                 result: origin::create_repo(bin, &namespace, &name, &branch),
             }
         }
+        Job::Mirror {
+            generation,
+            github,
+            namespace,
+        } => {
+            let full_name = origin::mirrored_full_name(&github, &namespace);
+            Msg::Mirrored {
+                generation,
+                full_name,
+                result: origin::create_mirror(bin, &github, &namespace),
+            }
+        }
+        Job::GithubSync {
+            generation,
+            clone_url,
+            github,
+            visibility,
+        } => Msg::GithubSynced {
+            generation,
+            result: github::sync(&clone_url, &github, &visibility),
+        },
+        Job::Delete {
+            generation,
+            full_name,
+        } => Msg::Deleted {
+            generation,
+            full_name: full_name.clone(),
+            result: origin::delete_repo(bin, &full_name),
+        },
+        Job::DeleteBranch {
+            generation,
+            full_name,
+            branch,
+        } => Msg::BranchDeleted {
+            generation,
+            full_name: full_name.clone(),
+            branch: branch.clone(),
+            result: origin::delete_branch(bin, &full_name, &branch),
+        },
     }
 }

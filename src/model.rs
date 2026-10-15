@@ -95,6 +95,8 @@ pub struct Commit {
 
 pub const VISIBILITIES: [&str; 2] = ["private", "internal"];
 
+pub const GITHUB_VISIBILITIES: [&str; 3] = ["private", "public", "internal"];
+
 #[derive(Clone, Debug)]
 pub struct Repo {
     pub owner: String,
@@ -112,6 +114,16 @@ pub struct Repo {
     pub commits: Vec<Commit>,
     pub commits_error: Option<String>,
     pub commits_for: Option<String>,
+    pub github_child: Option<String>,
+    pub readme: Option<Readme>,
+    pub readme_error: Option<String>,
+    pub readme_for: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Readme {
+    pub path: String,
+    pub text: String,
 }
 
 impl Repo {
@@ -133,6 +145,10 @@ impl Repo {
             commits: Vec::new(),
             commits_error: None,
             commits_for: None,
+            github_child: None,
+            readme: None,
+            readme_error: None,
+            readme_for: None,
         }
     }
 
@@ -328,6 +344,29 @@ impl Repo {
         if let Some(url) = self.web_url() {
             fields.push(Field::same(FieldId::Web, "web", url.to_string()));
         }
+        if let Some(github) = &self.github_child {
+            fields.push(Field::new(
+                FieldId::GithubChild,
+                "github child",
+                github.clone(),
+                crate::github::web_url(github),
+            ));
+        }
+        if let Some(readme) = &self.readme {
+            fields.push(Field::new(
+                FieldId::Readme,
+                "readme",
+                readme.path.clone(),
+                readme.text.clone(),
+            ));
+        } else if let Some(err) = &self.readme_error {
+            fields.push(Field::new(
+                FieldId::Readme,
+                "readme",
+                err.clone(),
+                String::new(),
+            ));
+        }
         if let Some(api) = self.api() {
             push_flag(
                 &mut fields,
@@ -500,6 +539,8 @@ pub enum FieldId {
     Id,
     Namespace,
     Github,
+    GithubChild,
+    Readme,
     Transition,
 }
 
@@ -694,6 +735,64 @@ impl CreateForm {
             _ => &mut self.branch,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct MirrorForm {
+    pub github: Editor,
+    pub namespace: Editor,
+    pub focus: usize,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub generation: u64,
+}
+
+impl MirrorForm {
+    pub fn focused_editor(&mut self) -> &mut Editor {
+        if self.focus == 0 {
+            &mut self.github
+        } else {
+            &mut self.namespace
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GithubChildForm {
+    pub github: Editor,
+    pub visibility: usize,
+    pub focus: usize,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteForm {
+    pub full_name: String,
+    pub confirm: Editor,
+    pub mirrored: bool,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteBranchForm {
+    pub full_name: String,
+    pub branch: String,
+    pub confirm: Editor,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReadmeView {
+    pub full_name: String,
+    pub path: String,
+    pub text: String,
+    pub scroll: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1089,6 +1188,21 @@ mod tests {
                 .iter()
                 .any(|field| field.id == FieldId::Squash && field.display == "off")
         );
+    }
+
+    #[test]
+    fn github_child_copies_the_github_url() {
+        let mut repo = repo("acme", "widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        let field = repo
+            .fields()
+            .into_iter()
+            .find(|field| field.id == FieldId::GithubChild)
+            .unwrap();
+        assert_eq!(field.label, "github child");
+        assert_eq!(field.display, "acme/checkout");
+        assert_eq!(field.copy, "https://github.com/acme/checkout");
+        assert!(!FieldId::GithubChild.editable());
     }
 
     #[test]

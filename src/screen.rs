@@ -13,6 +13,8 @@ pub struct Screen {
     pub list_height: usize,
     pub list_offset: usize,
     pub spans: Vec<DetailSpan>,
+    pub readme_rows: usize,
+    pub readme_height: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -21,6 +23,9 @@ pub struct Hits {
     pub refresh: Option<Rect>,
     pub copy_clone: Option<Rect>,
     pub copy_web: Option<Rect>,
+    pub mirror: Option<Rect>,
+    pub sync: Option<Rect>,
+    pub delete: Option<Rect>,
     pub filter: Option<Rect>,
     pub list_area: Option<Rect>,
     pub detail_area: Option<Rect>,

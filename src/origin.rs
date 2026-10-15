@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use serde_json::Value;
 
 use crate::model::{
     ApiRepo, AuthStatus, Branch, COMMIT_LIMIT, Commit, ListedRepo, Namespace, PULL_LIMIT,
-    PullRequest, RepoPatch, ViewRepo,
+    PullRequest, Readme, RepoPatch, ViewRepo,
 };
 use crate::text::strip_ansi;
 
@@ -134,6 +135,118 @@ pub fn create_preview(namespace: &str, name: &str, branch: &str) -> String {
         return "origin repo create <name>".to_string();
     }
     format!("origin {}", create_args(namespace, name, branch).join(" "))
+}
+
+pub fn mirror_args(github: &str, namespace: &str) -> Vec<String> {
+    let mut args = vec![
+        "repo".to_string(),
+        "create-mirrored".to_string(),
+        github.to_string(),
+    ];
+    if !namespace.is_empty() {
+        args.push("--namespace".to_string());
+        args.push(namespace.to_string());
+    }
+    args
+}
+
+pub fn mirror_preview(github: &str, namespace: &str) -> String {
+    if github.is_empty() {
+        return "origin repo create-mirrored <owner/repo>".to_string();
+    }
+    format!("origin {}", mirror_args(github, namespace).join(" "))
+}
+
+pub fn mirrored_full_name(github: &str, namespace: &str) -> String {
+    let name = github
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(github);
+    if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{namespace}/{name}")
+    }
+}
+
+pub fn create_mirror(bin: &Path, github: &str, namespace: &str) -> Result<(), String> {
+    let _ = run(bin, mirror_args(github, namespace))?;
+    Ok(())
+}
+
+pub fn delete_args(full_name: &str) -> Vec<String> {
+    vec![
+        "repo".to_string(),
+        "delete".to_string(),
+        full_name.to_string(),
+        "--yes".to_string(),
+    ]
+}
+
+pub fn delete_preview(full_name: &str) -> String {
+    format!("origin {}", delete_args(full_name).join(" "))
+}
+
+pub fn delete_repo(bin: &Path, full_name: &str) -> Result<(), String> {
+    if !safe_repo_name(full_name) {
+        return Err("Refusing an unsafe repository name.".to_string());
+    }
+    let _ = run(bin, delete_args(full_name))?;
+    Ok(())
+}
+
+fn safe_repo_name(full_name: &str) -> bool {
+    !full_name.is_empty()
+        && !full_name.starts_with('-')
+        && !full_name
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+}
+
+fn safe_branch_name(branch: &str) -> bool {
+    if branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.contains("//")
+        || branch
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return false;
+    }
+    branch
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != ".." && !part.starts_with('-'))
+}
+
+pub fn delete_branch_args(full_name: &str, branch: &str) -> Result<Vec<String>, String> {
+    if !safe_repo_name(full_name) || !safe_branch_name(branch) {
+        return Err("Refusing an unsafe repository or branch name.".to_string());
+    }
+    let (owner, name) = repo_parts(full_name)?;
+    let path = format!(
+        "/repos/{owner}/{name}/git/refs/heads/{}",
+        encode_seg(branch)
+    );
+    Ok(vec![
+        "api".to_string(),
+        "-X".to_string(),
+        "DELETE".to_string(),
+        path,
+    ])
+}
+
+pub fn delete_branch_preview(full_name: &str, branch: &str) -> String {
+    match delete_branch_args(full_name, branch) {
+        Ok(args) => format!("origin {}", args.join(" ")),
+        Err(err) => err,
+    }
+}
+
+pub fn delete_branch(bin: &Path, full_name: &str, branch: &str) -> Result<(), String> {
+    let _ = run(bin, delete_branch_args(full_name, branch)?)?;
+    Ok(())
 }
 
 pub fn auth_status(bin: &Path) -> Result<AuthStatus, String> {
@@ -271,6 +384,73 @@ pub fn commits_path(full_name: &str, branch: &str) -> Result<String, String> {
 pub fn list_commits(bin: &Path, full_name: &str, branch: &str) -> Result<Vec<Commit>, String> {
     let path = commits_path(full_name, branch)?;
     parse_commits(&run(bin, ["api", &path])?)
+}
+
+pub fn readme_query(full_name: &str, branch: &str) -> Result<String, String> {
+    let (owner, name) = repo_parts(full_name)?;
+    let mut path = format!("/repos/{owner}/{name}/contents?path=README.md");
+    if !branch.is_empty() {
+        path.push_str("&ref=");
+        path.push_str(&encode_seg(branch));
+    }
+    Ok(path)
+}
+
+pub enum ReadmeFetch {
+    Missing,
+    Found(Readme),
+}
+
+pub fn readme_absent(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("404")
+        || lower.contains("not found")
+        || lower.contains("notfound")
+        || lower.contains("409")
+}
+
+pub fn parse_readme(body: &str) -> Result<ReadmeFetch, String> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|_| "Origin returned an unreadable README response.".to_string())?;
+    let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+    if kind == "dir" {
+        return Err("README.md is a directory.".to_string());
+    }
+    if kind != "file" {
+        return Err("Origin did not return README.md.".to_string());
+    }
+    let content = value.get("content").and_then(Value::as_str).unwrap_or("");
+    let text = decode_readme(content)?;
+    let path = value
+        .get("path")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .unwrap_or("README.md");
+    Ok(ReadmeFetch::Found(Readme {
+        path: path.to_string(),
+        text,
+    }))
+}
+
+fn decode_readme(content: &str) -> Result<String, String> {
+    let cleaned: String = content.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return Ok(String::new());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleaned)
+        .map_err(|_| "README.md is not valid base64.".to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn fetch_readme(bin: &Path, full_name: &str, branch: &str) -> Result<ReadmeFetch, String> {
+    let path = readme_query(full_name, branch)?;
+    match run(bin, ["api", &path]) {
+        Ok(body) => parse_readme(&body),
+        Err(err) if readme_absent(&err) => Ok(ReadmeFetch::Missing),
+        Err(err) => Err(err),
+    }
 }
 
 fn repo_parts(full_name: &str) -> Result<(String, String), String> {
@@ -801,6 +981,99 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mirror_command_names_the_github_repo_and_namespace() {
+        assert_eq!(
+            mirror_args("acme/checkout", "splaice"),
+            vec![
+                "repo".to_string(),
+                "create-mirrored".to_string(),
+                "acme/checkout".to_string(),
+                "--namespace".to_string(),
+                "splaice".to_string(),
+            ]
+        );
+        assert_eq!(
+            mirror_args("acme/checkout", ""),
+            vec![
+                "repo".to_string(),
+                "create-mirrored".to_string(),
+                "acme/checkout".to_string(),
+            ]
+        );
+        assert_eq!(
+            mirrored_full_name("acme/checkout", "splaice"),
+            "splaice/checkout"
+        );
+        assert_eq!(mirrored_full_name("acme/checkout", ""), "checkout");
+    }
+
+    #[test]
+    fn delete_command_names_the_repository_and_skips_the_prompt() {
+        assert_eq!(
+            delete_args("acme/widget"),
+            vec![
+                "repo".to_string(),
+                "delete".to_string(),
+                "acme/widget".to_string(),
+                "--yes".to_string(),
+            ]
+        );
+        assert_eq!(
+            delete_preview("acme/widget"),
+            "origin repo delete acme/widget --yes"
+        );
+        assert!(delete_repo(std::path::Path::new("origin"), "-acme/widget").is_err());
+    }
+
+    #[test]
+    fn delete_branch_command_encodes_the_ref() {
+        assert_eq!(
+            delete_branch_args("acme/widget", "topic/one").unwrap(),
+            vec![
+                "api".to_string(),
+                "-X".to_string(),
+                "DELETE".to_string(),
+                "/repos/acme/widget/git/refs/heads/topic%2Fone".to_string(),
+            ]
+        );
+        assert_eq!(
+            delete_branch_preview("acme/widget", "topic/one"),
+            "origin api -X DELETE /repos/acme/widget/git/refs/heads/topic%2Fone"
+        );
+        let origin = std::path::Path::new("origin");
+        assert!(delete_branch(origin, "acme/widget", "-topic").is_err());
+        assert!(delete_branch(origin, "-acme/widget", "topic").is_err());
+        assert!(delete_branch(origin, "acme/widget", "topic/../one").is_err());
+    }
+
+    #[test]
+    fn readme_query_names_the_file_and_the_branch() {
+        assert_eq!(
+            readme_query("acme/widget", "topic/one").unwrap(),
+            "/repos/acme/widget/contents?path=README.md&ref=topic%2Fone"
+        );
+        assert_eq!(
+            readme_query("acme/widget", "").unwrap(),
+            "/repos/acme/widget/contents?path=README.md"
+        );
+        assert!(readme_absent("404 Not Found"));
+        assert!(readme_absent("409 Conflict"));
+        assert!(!readme_absent("400 FailedPrecondition"));
+        let parsed = parse_readme(
+            r#"{"type":"file","encoding":"base64","name":"README.md","path":"README.md","content":"IyBIaQ=="}"#,
+        )
+        .unwrap();
+        match parsed {
+            ReadmeFetch::Found(readme) => {
+                assert_eq!(readme.path, "README.md");
+                assert_eq!(readme.text, "# Hi");
+            }
+            ReadmeFetch::Missing => panic!("expected the file"),
+        }
+        assert!(parse_readme(r#"{"type":"dir","entries":[]}"#).is_err());
     }
 
     #[test]

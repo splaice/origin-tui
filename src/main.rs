@@ -1,5 +1,7 @@
 mod app;
 mod clipboard;
+mod github;
+mod markdown;
 mod model;
 mod origin;
 mod screen;
