@@ -11,6 +11,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub const SYNC_NOTE: &str = "Origin is the source. Sync makes GitHub match it, including removing branches and tags that exist only on GitHub. Visibility is used only when the GitHub repository is created.";
 
+pub const COMMITS_NOTE: &str = "Pushes this repository's branches and tags so the GitHub child has Origin's commits. Branches and tags that exist only on GitHub stay. A branch that has diverged is left as it is.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Child {
     pub github: String,
@@ -69,6 +71,112 @@ pub fn push_args(repo_dir: &str, github: &str) -> Vec<String> {
         "--mirror".to_string(),
         ssh_url(github),
     ]
+}
+
+pub fn ls_remote_args(github: &str) -> Vec<String> {
+    vec![
+        "ls-remote".to_string(),
+        "--heads".to_string(),
+        ssh_url(github),
+    ]
+}
+
+pub fn tip_args(repo_dir: &str) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        repo_dir.to_string(),
+        "for-each-ref".to_string(),
+        "--format=%(refname)".to_string(),
+        "refs/heads".to_string(),
+        "refs/tags".to_string(),
+    ]
+}
+
+pub fn push_commits_args(repo_dir: &str, github: &str, heads: bool, tags: bool) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_string(),
+        repo_dir.to_string(),
+        "push".to_string(),
+        ssh_url(github),
+    ];
+    if heads {
+        args.push("refs/heads/*:refs/heads/*".to_string());
+    }
+    if tags {
+        args.push("refs/tags/*:refs/tags/*".to_string());
+    }
+    args
+}
+
+pub fn commits_preview(github: &str) -> String {
+    let github = github.trim();
+    let remote = if github.is_empty() {
+        "git@github.com:<owner/repo>.git".to_string()
+    } else {
+        ssh_url(github)
+    };
+    format!("git push {remote} refs/heads/*:refs/heads/* refs/tags/*:refs/tags/*")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Current,
+    Stale(Vec<String>),
+}
+
+pub fn parse_heads(text: &str) -> BTreeMap<String, String> {
+    let mut heads = BTreeMap::new();
+    for line in text.lines() {
+        let Some((sha, rest)) = line.split_once(['\t', ' ']) else {
+            continue;
+        };
+        let sha = sha.trim();
+        let Some(branch) = rest.trim().strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if branch.is_empty() || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            continue;
+        }
+        heads.insert(branch.to_string(), sha.to_ascii_lowercase());
+    }
+    heads
+}
+
+pub fn compare_heads(origin: &[(&str, &str)], github: &BTreeMap<String, String>) -> Freshness {
+    let mut stale = Vec::new();
+    for (name, sha) in origin {
+        let sha = sha.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let current = !sha.is_empty()
+            && github
+                .get(*name)
+                .is_some_and(|remote| remote.eq_ignore_ascii_case(sha));
+        if !current {
+            stale.push((*name).to_string());
+        }
+    }
+    if stale.is_empty() {
+        Freshness::Current
+    } else {
+        Freshness::Stale(stale)
+    }
+}
+
+pub fn remote_missing(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("repository not found")
+        || (lower.contains("not found") && lower.contains("repository"))
+}
+
+pub fn check_child(github: &str, branches: &[(&str, &str)]) -> Result<Freshness, String> {
+    if !safe_github(github) {
+        return Err("Use a GitHub repository as owner/repo.".to_string());
+    }
+    let git = which("git").ok_or_else(|| "git not found".to_string())?;
+    let text = run(&git, &ls_remote_args(github), GH_TIMEOUT, true)?;
+    Ok(compare_heads(branches, &parse_heads(&text)))
 }
 
 pub fn sync_preview(github: &str, visibility: &str) -> String {
@@ -189,6 +297,36 @@ pub fn sync(clone_url: &str, github: &str, visibility: &str) -> Result<(), Strin
     let dest = dir.display().to_string();
     run(&git, &clone_args(clone_url, &dest), GIT_TIMEOUT, true)?;
     run(&git, &push_args(&dest, github), GIT_TIMEOUT, true)?;
+    drop(guard);
+    Ok(())
+}
+
+pub fn push_commits(clone_url: &str, github: &str, visibility: &str) -> Result<(), String> {
+    if !safe_clone_url(clone_url) {
+        return Err("Refusing an unsafe clone URL.".to_string());
+    }
+    if !safe_github(github) {
+        return Err("Use a GitHub repository as owner/repo.".to_string());
+    }
+    let gh = which("gh")
+        .ok_or_else(|| "gh CLI not found. Install GitHub CLI and run gh auth login.".to_string())?;
+    let git = which("git").ok_or_else(|| "git not found".to_string())?;
+    ensure_repo(&gh, github, visibility)?;
+    let dir = bare_dir();
+    let guard = BareDir(dir.clone());
+    let dest = dir.display().to_string();
+    run(&git, &clone_args(clone_url, &dest), GIT_TIMEOUT, true)?;
+    let names = run(&git, &tip_args(&dest), GIT_TIMEOUT, true)?;
+    let heads = names.lines().any(|line| line.starts_with("refs/heads/"));
+    let tags = names.lines().any(|line| line.starts_with("refs/tags/"));
+    if heads || tags {
+        run(
+            &git,
+            &push_commits_args(&dest, github, heads, tags),
+            GIT_TIMEOUT,
+            true,
+        )?;
+    }
     drop(guard);
     Ok(())
 }
@@ -485,6 +623,60 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed["acme/widget"].visibility, "private");
         assert!(!parsed["acme/widget"].github.contains("ghp_"));
+    }
+
+    #[test]
+    fn child_heads_match_origin_or_name_the_stale_branches() {
+        let text = "abc\trefs/heads/main\nABC\trefs/heads/Topic\nff\trefs/tags/v1\nnope\n";
+        let heads = parse_heads(text);
+        assert_eq!(heads.get("main").map(String::as_str), Some("abc"));
+        assert_eq!(heads.get("Topic").map(String::as_str), Some("abc"));
+        assert!(!heads.contains_key("v1"));
+        assert_eq!(
+            compare_heads(&[("main", "ABC")], &heads),
+            Freshness::Current
+        );
+        assert_eq!(
+            compare_heads(
+                &[("main", "fff"), ("topic/one", "def"), ("", "abc")],
+                &heads
+            ),
+            Freshness::Stale(vec!["main".to_string(), "topic/one".to_string()])
+        );
+        assert_eq!(
+            compare_heads(&[("main", "")], &heads),
+            Freshness::Stale(vec!["main".to_string()])
+        );
+        assert_eq!(compare_heads(&[], &heads), Freshness::Current);
+        assert!(remote_missing(
+            "git: ERROR: Repository not found.\nfatal: Could not read from remote repository."
+        ));
+        assert!(remote_missing("fatal: repository 'x' not found"));
+        assert!(!remote_missing("Permission denied (publickey)"));
+        let listed = ls_remote_args("acme/widget");
+        assert_eq!(
+            listed,
+            [
+                "ls-remote".to_string(),
+                "--heads".to_string(),
+                "git@github.com:acme/widget.git".to_string(),
+            ]
+        );
+        let heads_only = push_commits_args("/tmp/ot-bare", "acme/widget", true, false);
+        assert!(
+            heads_only
+                .iter()
+                .any(|arg| arg == "refs/heads/*:refs/heads/*"),
+            "{heads_only:?}"
+        );
+        assert!(!heads_only.iter().any(|arg| arg.contains("tags")));
+        assert!(!heads_only.iter().any(|arg| arg == "--mirror"));
+        let both = push_commits_args("/tmp/ot-bare", "acme/widget", true, true);
+        assert!(both.iter().any(|arg| arg == "refs/tags/*:refs/tags/*"));
+        let preview = commits_preview("acme/widget");
+        assert!(preview.contains("refs/heads/*:refs/heads/*"), "{preview}");
+        assert!(!preview.contains("--mirror"), "{preview}");
+        assert_eq!(tip_args("/tmp/ot-bare")[2], "for-each-ref");
     }
 
     #[test]

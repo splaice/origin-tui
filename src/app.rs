@@ -9,11 +9,11 @@ use ratatui::buffer::Buffer;
 
 use crate::github::{self, Child};
 use crate::model::{
-    ApiRepo, AuthStatus, CreateForm, DeleteBranchForm, DeleteForm, DetailCursor, DetailSpan,
-    DetailTarget, DisplayRow, EditForm, EditKind, Editor, FieldId, GITHUB_VISIBILITIES,
+    ApiRepo, AuthStatus, ChildStatus, CreateForm, DeleteBranchForm, DeleteForm, DetailCursor,
+    DetailSpan, DetailTarget, DisplayRow, EditForm, EditKind, Editor, FieldId, GITHUB_VISIBILITIES,
     GithubChildForm, ListedRepo, MirrorForm, Namespace, ReadmeView, Repo, RepoPatch, RowKind,
-    VISIBILITIES, ViewRepo, detail_lines, display_rows, order_branches, preferred_branch,
-    spans_from,
+    SyncCommitsForm, VISIBILITIES, ViewRepo, detail_lines, display_rows, order_branches,
+    preferred_branch, spans_from,
 };
 use crate::origin;
 use crate::screen::{FieldHit, Screen, contains};
@@ -31,6 +31,7 @@ pub enum Overlay {
     Create(CreateForm),
     Mirror(MirrorForm),
     GithubChild(GithubChildForm),
+    SyncCommits(SyncCommitsForm),
     Delete(DeleteForm),
     DeleteBranch(DeleteBranchForm),
     Readme(ReadmeView),
@@ -85,6 +86,18 @@ pub enum Job {
         namespace: String,
     },
     GithubSync {
+        generation: u64,
+        clone_url: String,
+        github: String,
+        visibility: String,
+    },
+    ChildStatus {
+        generation: u64,
+        full_name: String,
+        github: String,
+        branches: Vec<crate::model::Branch>,
+    },
+    SyncCommits {
         generation: u64,
         clone_url: String,
         github: String,
@@ -156,6 +169,16 @@ pub enum Msg {
         result: Result<(), String>,
     },
     GithubSynced {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    ChildStatus {
+        generation: u64,
+        full_name: String,
+        github: String,
+        result: Result<github::Freshness, String>,
+    },
+    CommitsSynced {
         generation: u64,
         result: Result<(), String>,
     },
@@ -231,6 +254,8 @@ pub struct App {
     readme_branch: Option<String>,
     readme_rows: usize,
     readme_height: usize,
+    child_check_inflight: bool,
+    child_check_github: Option<String>,
     pub overlay: Option<Overlay>,
     pub toast: Option<Toast>,
     pub selection: Option<Selection>,
@@ -245,6 +270,7 @@ pub struct App {
     edit_generation: u64,
     commits_generation: u64,
     readme_generation: u64,
+    child_check_generation: u64,
     pending_select: Option<String>,
     press: Option<Press>,
     children: BTreeMap<String, Child>,
@@ -284,6 +310,8 @@ impl Default for App {
             readme_branch: None,
             readme_rows: 0,
             readme_height: 0,
+            child_check_inflight: false,
+            child_check_github: None,
             overlay: None,
             toast: None,
             selection: None,
@@ -298,6 +326,7 @@ impl Default for App {
             edit_generation: 0,
             commits_generation: 0,
             readme_generation: 0,
+            child_check_generation: 0,
             pending_select: None,
             press: None,
             children: BTreeMap::new(),
@@ -498,7 +527,10 @@ impl App {
             }
             return Effect::None;
         }
-        if matches!(self.overlay, Some(Overlay::Readme(_))) {
+        if matches!(
+            self.overlay,
+            Some(Overlay::Readme(_) | Overlay::SyncCommits(_))
+        ) {
             return Effect::None;
         }
         if self.focus == Focus::Filter {
@@ -607,6 +639,8 @@ impl App {
                                     repo.commits_error = prev.commits_error.clone();
                                     repo.commits_for = prev.commits_for.clone();
                                     repo.github_child = prev.github_child.clone();
+                                    repo.child_status = prev.child_status.clone();
+                                    repo.child_status_for = prev.child_status_for.clone();
                                     repo.readme = prev.readme.clone();
                                     repo.readme_error = prev.readme_error.clone();
                                     repo.readme_for = prev.readme_for.clone();
@@ -912,7 +946,11 @@ impl App {
                             self.overlay = None;
                         }
                         self.toast("Synced to GitHub", ToastKind::Info);
-                        Vec::new()
+                        if current {
+                            self.ensure_child_status(true)
+                        } else {
+                            Vec::new()
+                        }
                     }
                     Err(err) => {
                         if current && let Some(Overlay::GithubChild(form)) = &mut self.overlay {
@@ -923,6 +961,60 @@ impl App {
                         }
                         Vec::new()
                     }
+                }
+            }
+            Msg::ChildStatus {
+                generation,
+                full_name,
+                github,
+                result,
+            } => {
+                if generation != self.child_check_generation {
+                    return Vec::new();
+                }
+                self.child_check_inflight = false;
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| repo.full_name == full_name)
+                    && repo.github_child.as_deref() == Some(github.as_str())
+                {
+                    repo.child_status_for = Some(github);
+                    repo.child_status = Some(match result {
+                        Ok(github::Freshness::Current) => ChildStatus::Current,
+                        Ok(github::Freshness::Stale(names)) => ChildStatus::Stale(names),
+                        Err(err) if github::remote_missing(&err) => ChildStatus::Missing,
+                        Err(err) => ChildStatus::Failed(err),
+                    });
+                }
+                Vec::new()
+            }
+            Msg::CommitsSynced { generation, result } => {
+                let current = generation == self.github_generation;
+                let jobs = match result {
+                    Ok(()) => {
+                        if current && matches!(self.overlay, Some(Overlay::SyncCommits(_))) {
+                            self.overlay = None;
+                        }
+                        self.toast("Synced commits to GitHub", ToastKind::Info);
+                        Vec::new()
+                    }
+                    Err(err) => {
+                        if current && let Some(Overlay::SyncCommits(form)) = &mut self.overlay {
+                            form.busy = false;
+                            form.error = Some(err);
+                        } else if current {
+                            self.toast(err, ToastKind::Err);
+                        }
+                        Vec::new()
+                    }
+                };
+                if current {
+                    let mut jobs = jobs;
+                    jobs.extend(self.ensure_child_status(true));
+                    jobs
+                } else {
+                    jobs
                 }
             }
             Msg::Deleted {
@@ -1039,6 +1131,10 @@ impl App {
     fn apply_children(&mut self) {
         for repo in &mut self.repos {
             if let Some(child) = self.children.get(&repo.full_name) {
+                if repo.child_status_for.as_deref() != Some(child.github.as_str()) {
+                    repo.child_status = None;
+                    repo.child_status_for = None;
+                }
                 repo.github_child = Some(child.github.clone());
             }
         }
@@ -1340,6 +1436,9 @@ impl App {
         if matches!(self.overlay, Some(Overlay::GithubChild(_))) {
             return self.github_overlay_key(key);
         }
+        if matches!(self.overlay, Some(Overlay::SyncCommits(_))) {
+            return self.sync_commits_overlay_key(key);
+        }
         if matches!(self.overlay, Some(Overlay::Delete(_))) {
             return self.delete_overlay_key(key);
         }
@@ -1483,6 +1582,10 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.open_github_child();
+                Some(Effect::None)
+            }
+            KeyCode::Char('u') => {
+                self.open_sync_commits();
                 Some(Effect::None)
             }
             KeyCode::Char('d') => {
@@ -1891,6 +1994,7 @@ impl App {
             self.branches_inflight = false;
             self.commits_inflight = false;
             self.readme_inflight = false;
+            self.child_check_inflight = false;
             return Vec::new();
         }
         if previous != next {
@@ -1902,6 +2006,9 @@ impl App {
             self.readme_generation += 1;
             self.readme_inflight = false;
             self.readme_branch = None;
+            self.child_check_generation += 1;
+            self.child_check_inflight = false;
+            self.child_check_github = None;
         }
         if previous != next || refresh {
             self.detail_generation += 1;
@@ -1965,14 +2072,72 @@ impl App {
         } else {
             None
         };
-        let Some(name) = locked.or_else(|| self.selected_repo().and_then(preferred_branch)) else {
+        let mut jobs = if let Some(name) =
+            locked.or_else(|| self.selected_repo().and_then(preferred_branch))
+        {
+            self.select_branch(name, force)
+        } else {
             let branch = self
                 .selected_repo()
                 .and_then(|repo| repo.default_branch_name())
                 .unwrap_or_default();
-            return self.ensure_readme(&branch, force);
+            self.ensure_readme(&branch, force)
         };
-        self.select_branch(name, force)
+        jobs.extend(self.ensure_child_status(force));
+        jobs
+    }
+
+    fn ensure_child_status(&mut self, force: bool) -> Vec<Job> {
+        if self.branches_inflight {
+            return Vec::new();
+        }
+        let Some(full_name) = self.selected_name() else {
+            return Vec::new();
+        };
+        let prepared = self.selected_repo().and_then(|repo| {
+            if repo.mirrored() {
+                return None;
+            }
+            let github = repo.github_child.clone()?;
+            if repo.branches_error.is_some() && repo.branches.is_empty() {
+                return None;
+            }
+            let settled = repo.child_status_for.as_deref() == Some(github.as_str())
+                && repo
+                    .child_status
+                    .as_ref()
+                    .is_some_and(|status| !matches!(status, ChildStatus::Checking));
+            Some((github, repo.branches.clone(), settled))
+        });
+        let Some((github, branches, settled)) = prepared else {
+            return Vec::new();
+        };
+        let same = self.child_check_github.as_deref() == Some(github.as_str());
+        if self.child_check_inflight && same && !force {
+            return Vec::new();
+        }
+        if settled && !force {
+            return Vec::new();
+        }
+        self.child_check_generation += 1;
+        let generation = self.child_check_generation;
+        self.child_check_inflight = true;
+        self.child_check_github = Some(github.clone());
+        if let Some(repo) = self
+            .repos
+            .iter_mut()
+            .find(|repo| repo.full_name == full_name)
+            && repo.child_status_for.as_deref() != Some(github.as_str())
+        {
+            repo.child_status = Some(ChildStatus::Checking);
+            repo.child_status_for = Some(github.clone());
+        }
+        vec![Job::ChildStatus {
+            generation,
+            full_name,
+            github,
+            branches,
+        }]
     }
 
     fn select_branch(&mut self, name: String, force: bool) -> Vec<Job> {
@@ -2433,6 +2598,96 @@ impl App {
             form.error = None;
         }
         Effect::Jobs(vec![Job::GithubSync {
+            generation,
+            clone_url,
+            github,
+            visibility,
+        }])
+    }
+
+    fn open_sync_commits(&mut self) {
+        let waiting = self.detail_inflight;
+        let prepared = self.selected_repo().map(|repo| {
+            (
+                repo.view.is_none() && repo.api().is_none(),
+                repo.mirrored(),
+                repo.full_name.clone(),
+                repo.github_child.clone(),
+                repo.clone_url().map(str::to_string),
+            )
+        });
+        let Some((unknown, mirrored, origin_name, github, clone_url)) = prepared else {
+            self.toast("Select a repository", ToastKind::Info);
+            return;
+        };
+        let Some(github) = github else {
+            self.toast("This repository has no GitHub child.", ToastKind::Info);
+            return;
+        };
+        if unknown && waiting {
+            self.toast("Repository details are still loading", ToastKind::Info);
+            return;
+        }
+        if mirrored {
+            self.toast(
+                "GitHub is already the source. Origin is not.",
+                ToastKind::Info,
+            );
+            return;
+        }
+        let Some(clone_url) = clone_url else {
+            self.toast("This repository has no clone URL.", ToastKind::Info);
+            return;
+        };
+        let visibility = self
+            .children
+            .get(&origin_name)
+            .map(|child| child.visibility.clone())
+            .unwrap_or_else(|| "private".to_string());
+        self.github_generation += 1;
+        self.overlay = Some(Overlay::SyncCommits(SyncCommitsForm {
+            full_name: origin_name,
+            github,
+            clone_url,
+            visibility,
+            error: None,
+            busy: false,
+            generation: self.github_generation,
+        }));
+    }
+
+    fn sync_commits_overlay_key(&mut self, key: KeyEvent) -> Effect {
+        let busy = matches!(self.overlay, Some(Overlay::SyncCommits(ref form)) if form.busy);
+        if busy {
+            self.toast("Still syncing commits", ToastKind::Info);
+            return Effect::None;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                Effect::None
+            }
+            KeyCode::Enter => self.submit_sync_commits(),
+            _ => Effect::None,
+        }
+    }
+
+    fn submit_sync_commits(&mut self) -> Effect {
+        let Some(Overlay::SyncCommits(form)) = &self.overlay else {
+            return Effect::None;
+        };
+        if form.busy {
+            return Effect::None;
+        }
+        let generation = form.generation;
+        let clone_url = form.clone_url.clone();
+        let github = form.github.clone();
+        let visibility = form.visibility.clone();
+        if let Some(Overlay::SyncCommits(form)) = &mut self.overlay {
+            form.busy = true;
+            form.error = None;
+        }
+        Effect::Jobs(vec![Job::SyncCommits {
             generation,
             clone_url,
             github,
@@ -3264,6 +3519,165 @@ mod tests {
                 .map(|readme| readme.text.as_str()),
             Some("# Hi")
         );
+    }
+
+    #[test]
+    fn branches_check_whether_the_github_child_is_current() {
+        let mut repo = sample("acme", "widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        let mut app = fixture(vec![repo]);
+        app.branches_inflight = true;
+        app.detail_generation = 3;
+        let jobs = app.on_msg(Msg::Branches {
+            generation: 3,
+            full_name: "acme/widget".to_string(),
+            result: Ok(vec![
+                Branch {
+                    name: "main".to_string(),
+                    sha: "abc".to_string(),
+                },
+                Branch {
+                    name: "topic".to_string(),
+                    sha: "def".to_string(),
+                },
+            ]),
+        });
+        assert!(jobs.iter().any(|job| matches!(
+            job,
+            Job::ChildStatus { github, full_name, branches, .. }
+                if github == "acme/checkout"
+                    && full_name == "acme/widget"
+                    && branches.iter().any(|branch| branch.name == "main" && branch.sha == "abc")
+        )));
+        assert_eq!(app.repos[0].child_status, Some(ChildStatus::Checking));
+    }
+
+    #[test]
+    fn a_repo_without_a_child_skips_the_status_check() {
+        let mut app = fixture(vec![sample("acme", "widget")]);
+        app.branches_inflight = true;
+        let jobs = app.on_msg(Msg::Branches {
+            generation: 0,
+            full_name: "acme/widget".to_string(),
+            result: Ok(vec![Branch {
+                name: "main".to_string(),
+                sha: "abc".to_string(),
+            }]),
+        });
+        assert!(
+            jobs.iter()
+                .all(|job| !matches!(job, Job::ChildStatus { .. }))
+        );
+    }
+
+    #[test]
+    fn child_status_is_shown_and_a_stale_result_is_ignored() {
+        let mut repo = sample("acme", "widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        let mut app = fixture(vec![repo]);
+        app.child_check_generation = 4;
+        app.on_msg(Msg::ChildStatus {
+            generation: 4,
+            full_name: "acme/widget".to_string(),
+            github: "acme/checkout".to_string(),
+            result: Ok(github::Freshness::Stale(vec!["main".to_string()])),
+        });
+        let field = app.repos[0]
+            .fields()
+            .into_iter()
+            .find(|field| field.id == FieldId::ChildStatus)
+            .unwrap();
+        assert_eq!(field.display, "not up to date · main");
+        app.on_msg(Msg::ChildStatus {
+            generation: 2,
+            full_name: "acme/widget".to_string(),
+            github: "acme/checkout".to_string(),
+            result: Ok(github::Freshness::Current),
+        });
+        assert_eq!(
+            app.repos[0].child_status,
+            Some(ChildStatus::Stale(vec!["main".to_string()]))
+        );
+        app.on_msg(Msg::ChildStatus {
+            generation: 4,
+            full_name: "acme/widget".to_string(),
+            github: "acme/checkout".to_string(),
+            result: Err("git: ERROR: Repository not found.".to_string()),
+        });
+        assert_eq!(app.repos[0].child_status, Some(ChildStatus::Missing));
+    }
+
+    #[test]
+    fn u_pushes_origin_commits_to_the_github_child() {
+        let mut repo = sample("acme", "widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        let mut app = fixture(vec![repo]);
+        app.on_key(key('u'));
+        match &app.overlay {
+            Some(Overlay::SyncCommits(form)) => {
+                assert_eq!(form.github, "acme/checkout");
+                assert!(form.clone_url.contains("acme/widget.git"));
+                assert!(!github::commits_preview(&form.github).contains("--mirror"));
+            }
+            _ => panic!("sync commits did not open"),
+        }
+        match app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Effect::Jobs(jobs) => match &jobs[..] {
+                [
+                    Job::SyncCommits {
+                        github,
+                        clone_url,
+                        visibility,
+                        ..
+                    },
+                ] => {
+                    assert_eq!(github, "acme/checkout");
+                    assert_eq!(clone_url, "https://origin.cursor.com/acme/widget.git");
+                    assert_eq!(visibility, "private");
+                }
+                _ => panic!("expected a commit sync"),
+            },
+            _ => panic!("expected a commit sync"),
+        }
+    }
+
+    #[test]
+    fn u_without_a_child_does_not_push() {
+        let mut app = fixture(vec![sample("acme", "widget")]);
+        match app.on_key(key('u')) {
+            Effect::None => {}
+            Effect::Jobs(_) => panic!("a sync was started"),
+            Effect::Quit => panic!("quit"),
+            Effect::Copy { .. } => panic!("copy"),
+        }
+        assert!(app.overlay.is_none());
+        let toast = app.toast.as_ref().unwrap();
+        assert!(toast.text.contains("no GitHub child"), "{}", toast.text);
+    }
+
+    #[test]
+    fn synced_commits_ask_for_a_fresh_status() {
+        let mut repo = sample("acme", "widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        repo.branches = vec![Branch {
+            name: "main".to_string(),
+            sha: "abc".to_string(),
+        }];
+        let mut app = fixture(vec![repo]);
+        app.github_generation = 2;
+        app.branches_inflight = false;
+        let jobs = app.on_msg(Msg::CommitsSynced {
+            generation: 2,
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Synced commits to GitHub")
+        );
+        assert!(jobs.iter().any(|job| matches!(
+            job,
+            Job::ChildStatus { github, .. } if github == "acme/checkout"
+        )));
     }
 
     #[test]

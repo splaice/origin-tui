@@ -127,6 +127,32 @@ pub fn execute(bin: &Path, job: Job) -> Msg {
             generation,
             result: github::sync(&clone_url, &github, &visibility),
         },
+        Job::ChildStatus {
+            generation,
+            full_name,
+            github,
+            branches,
+        } => {
+            let tips: Vec<(&str, &str)> = branches
+                .iter()
+                .map(|branch| (branch.name.as_str(), branch.sha.as_str()))
+                .collect();
+            Msg::ChildStatus {
+                generation,
+                full_name,
+                github: github.clone(),
+                result: github::check_child(&github, &tips),
+            }
+        }
+        Job::SyncCommits {
+            generation,
+            clone_url,
+            github,
+            visibility,
+        } => Msg::CommitsSynced {
+            generation,
+            result: github::push_commits(&clone_url, &github, &visibility),
+        },
         Job::Delete {
             generation,
             full_name,

@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Focus, Overlay, ToastKind};
-use crate::github::{self, SYNC_NOTE};
+use crate::github::{self, COMMITS_NOTE, SYNC_NOTE};
 use crate::markdown::{self, Mark};
 use crate::model::{
     Commit, DetailCursor, DetailLine, DetailSpan, EditKind, Field, FieldId, GITHUB_VISIBILITIES,
@@ -35,6 +35,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Screen {
             Overlay::Create(form) => draw_create(frame, form, theme, &mut screen.hits),
             Overlay::Mirror(form) => draw_mirror(frame, form, theme, &mut screen.hits),
             Overlay::GithubChild(form) => draw_github_child(frame, form, theme, &mut screen.hits),
+            Overlay::SyncCommits(form) => draw_sync_commits(frame, form, theme, &mut screen.hits),
             Overlay::Delete(form) => draw_delete(frame, form, theme, &mut screen.hits),
             Overlay::DeleteBranch(form) => draw_delete_branch(frame, form, theme, &mut screen.hits),
             Overlay::Readme(view) => draw_readme(frame, view, theme, &mut screen),
@@ -695,6 +696,17 @@ fn draw_detail(
                         text,
                         field_style(theme, field, selected),
                     );
+                    if field.id == FieldId::ChildStatus && *part == 0 {
+                        let hint = "u sync";
+                        let hint_x = max_x.saturating_sub(display_width(hint) as u16);
+                        if hint_x > rect.right().saturating_add(2) {
+                            let mut hint_style = theme.faint();
+                            if selected {
+                                hint_style = hint_style.bg(theme.bg_selected);
+                            }
+                            put(buf, hint_x, y, max_x, hint, hint_style);
+                        }
+                    }
                     if field.id == FieldId::Readme && *part == 0 && !field.display.contains(' ') {
                         let hint = "view";
                         let hint_x = max_x.saturating_sub(display_width(hint) as u16);
@@ -963,6 +975,22 @@ fn pull_line(pull: &PullRequest) -> String {
     format!("#{}  {}  {}", pull.number, pull.status, pull.title)
 }
 
+fn child_status_style(theme: Theme, field: &Field, selected: bool) -> Style {
+    let mut style = if field.display.starts_with("up to date") {
+        theme.fg(theme.ok)
+    } else if field.display.starts_with("checking") {
+        theme.dim()
+    } else if field.display.starts_with("not up to date") || field.display == "missing" {
+        theme.fg(theme.warn)
+    } else {
+        theme.fg(theme.danger)
+    };
+    if selected {
+        style = style.bg(theme.bg_selected);
+    }
+    style
+}
+
 fn pull_style(theme: Theme, status: &str) -> Style {
     match status {
         "open" => theme.fg(theme.ok),
@@ -984,6 +1012,7 @@ fn field_style(theme: Theme, field: &Field, selected: bool) -> Style {
         }
         FieldId::MergeCommit | FieldId::Squash | FieldId::DeleteBranch => theme.dim(),
         FieldId::Clone | FieldId::Web | FieldId::GithubChild if !selected => theme.text(),
+        FieldId::ChildStatus => child_status_style(theme, field, selected),
         FieldId::Readme if field.display.contains(' ') => theme.fg(theme.danger),
         FieldId::Readme if selected => theme.accent().bg(theme.bg_selected),
         FieldId::Readme => theme.accent(),
@@ -1063,6 +1092,13 @@ fn draw_hints(
             ("esc", true),
             (" cancel", false),
         ],
+        (Some(Overlay::SyncCommits(_)), _) => &[
+            ("enter", true),
+            (" sync", false),
+            ("   ", false),
+            ("esc", true),
+            (" cancel", false),
+        ],
         (Some(Overlay::Readme(_)), _) => &[
             ("↑↓", true),
             (" scroll", false),
@@ -1113,6 +1149,27 @@ fn draw_hints(
                 ("   ", false),
                 ("enter", true),
                 (" view", false),
+                ("   ", false),
+                ("y", true),
+                (" copy", false),
+                ("   ", false),
+                ("tab", true),
+                (" list", false),
+                ("   ", false),
+                ("?", true),
+                (" help", false),
+            ]
+        }
+        (_, Focus::Detail)
+            if matches!(app.cursor, DetailCursor::Field)
+                && app.selected_field == FieldId::ChildStatus =>
+        {
+            &[
+                ("↑↓", true),
+                (" row", false),
+                ("   ", false),
+                ("u", true),
+                (" sync", false),
                 ("   ", false),
                 ("y", true),
                 (" copy", false),
@@ -1199,7 +1256,7 @@ fn draw_hints(
 }
 
 fn draw_help(frame: &mut Frame, theme: Theme, hits: &mut Hits) {
-    let area = centered(frame.area(), 56, 23);
+    let area = centered(frame.area(), 56, 24);
     hits.modal = Some(area);
     let block = Block::default()
         .title(Line::from(Span::styled(" Keys ", theme.bold_accent())))
@@ -1220,6 +1277,7 @@ fn draw_help(frame: &mut Frame, theme: Theme, hits: &mut Hits) {
         ("New repository", "n"),
         ("Mirror GitHub", "m"),
         ("Sync to GitHub", "s"),
+        ("Sync commits", "u"),
         ("Delete repository", "d"),
         ("Delete branch", "x"),
         ("Refresh", "r"),
@@ -1507,6 +1565,88 @@ fn draw_github_child(
     };
     if let Some(position) = cursor {
         frame.set_cursor_position(position);
+    }
+}
+
+fn draw_sync_commits(
+    frame: &mut Frame,
+    form: &crate::model::SyncCommitsForm,
+    theme: Theme,
+    hits: &mut Hits,
+) {
+    let area = centered(frame.area(), 74, 14);
+    hits.modal = Some(area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(
+            " Sync commits ",
+            theme.bold_accent(),
+        )))
+        .borders(Borders::ALL)
+        .border_style(theme.fg(theme.accent))
+        .style(Style::new().bg(theme.bg_raised).fg(theme.text));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let buf = frame.buffer_mut();
+    fill(buf, inner, theme.bg_raised, theme.text);
+    let mut y = inner.y;
+    let max_x = inner.right().saturating_sub(1);
+    if y < inner.bottom() {
+        put(
+            buf,
+            inner.x + 1,
+            y,
+            max_x,
+            &form.github,
+            theme.bold_accent(),
+        );
+        y += 1;
+    }
+    if y < inner.bottom() {
+        put(buf, inner.x + 1, y, max_x, &form.full_name, theme.dim());
+        y = y.saturating_add(2);
+    }
+    let note = if form.busy {
+        "Syncing commits…".to_string()
+    } else {
+        COMMITS_NOTE.to_string()
+    };
+    if y < inner.bottom() {
+        y = write_lines(
+            buf,
+            inner.x + 1,
+            y,
+            max_x,
+            inner.bottom(),
+            &note,
+            theme.dim(),
+        );
+        y = y.saturating_add(1);
+    }
+    if y < inner.bottom() {
+        y = write_lines(
+            buf,
+            inner.x + 1,
+            y,
+            max_x,
+            inner.bottom(),
+            &github::commits_preview(&form.github),
+            theme.faint(),
+        );
+        y = y.saturating_add(1);
+    }
+    if let Some(err) = &form.error
+        && y < inner.bottom()
+    {
+        write_lines(
+            buf,
+            inner.x + 1,
+            y,
+            max_x,
+            inner.bottom(),
+            err,
+            theme.fg(theme.danger),
+        );
     }
 }
 
@@ -2272,7 +2412,7 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::model::{
-        ApiRepo, AuthStatus, Branch, Commit, ListedRepo, PullRequest, Repo, ViewRepo,
+        ApiRepo, AuthStatus, Branch, ChildStatus, Commit, ListedRepo, PullRequest, Repo, ViewRepo,
     };
     use crate::selection::{self, Selection};
     use ratatui::Terminal;
@@ -2380,6 +2520,7 @@ mod tests {
         assert!(text.contains("Delete branch"), "{text}");
         assert!(text.contains("View README"), "{text}");
         assert!(text.contains("Mirror GitHub"), "{text}");
+        assert!(text.contains("Sync commits"), "{text}");
     }
 
     #[test]
@@ -2415,6 +2556,40 @@ mod tests {
         assert!(text.contains("readme"), "{text}");
         assert!(text.contains("README.md"), "{text}");
         assert!(text.contains("view"), "{text}");
+    }
+
+    #[test]
+    fn child_status_offers_a_sync() {
+        let mut repo = native("widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        repo.child_status = Some(ChildStatus::Stale(vec!["main".to_string()]));
+        repo.child_status_for = Some("acme/checkout".to_string());
+        let app = app_with(vec![repo]);
+        let (buf, _) = render(&app, 110, 32);
+        let text = plain(&buf);
+        assert!(text.contains("child status"), "{text}");
+        assert!(text.contains("not up to date"), "{text}");
+        assert!(text.contains("u sync"), "{text}");
+    }
+
+    #[test]
+    fn sync_commits_dialog_pushes_branches_and_tags() {
+        let mut app = app_with(vec![native("widget")]);
+        app.overlay = Some(Overlay::SyncCommits(crate::model::SyncCommitsForm {
+            full_name: "acme/widget".to_string(),
+            github: "acme/checkout".to_string(),
+            clone_url: "https://origin.cursor.com/acme/widget.git".to_string(),
+            visibility: "private".to_string(),
+            error: None,
+            busy: false,
+            generation: 1,
+        }));
+        let (buf, _) = render(&app, 110, 36);
+        let text = plain(&buf);
+        assert!(text.contains("acme/checkout"), "{text}");
+        assert!(text.contains("refs/heads/*:refs/heads/*"), "{text}");
+        assert!(text.contains("exist only on GitHub"), "{text}");
+        assert!(!text.contains("--mirror"), "{text}");
     }
 
     #[test]

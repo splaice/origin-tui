@@ -42,6 +42,7 @@ The list groups repositories by owner when more than one owner is present. An `m
 | New repository | `n` |
 | Mirror from GitHub | `m` |
 | Sync to GitHub | `s` |
+| Sync commits | `u` |
 | Delete repository | `d` |
 | Delete branch | `x` |
 | Refresh | `r` |
@@ -74,6 +75,8 @@ Branches appear when the repository has more than one. Focusing a branch loads i
 `m` mirrors a GitHub repository into Origin. GitHub stays the source. The created name is `{namespace}/{github-repo}`.
 
 `s` syncs an Origin repository out to a GitHub child. Origin stays the source. The form takes `owner/repo` and a visibility used only when the GitHub repository has to be created. The mapping is saved in `~/.origin-tui/children.json`, then `ot` pushes a mirror of the Origin repository to `git@github.com:owner/repo.git`. That push removes branches and tags that exist only on GitHub. A repository that is already a GitHub mirror is refused, because GitHub is already the source.
+
+When a repository has a GitHub child, its details include a `child status` row. That row says whether the child's branches match Origin. `u` pushes this repository's branches and tags to the child so GitHub has Origin's commits. Branches and tags that exist only on GitHub stay, and a branch that has diverged is left as it is.
 
 ## Deleting
 

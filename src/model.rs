@@ -115,6 +115,8 @@ pub struct Repo {
     pub commits_error: Option<String>,
     pub commits_for: Option<String>,
     pub github_child: Option<String>,
+    pub child_status: Option<ChildStatus>,
+    pub child_status_for: Option<String>,
     pub readme: Option<Readme>,
     pub readme_error: Option<String>,
     pub readme_for: Option<String>,
@@ -146,6 +148,8 @@ impl Repo {
             commits_error: None,
             commits_for: None,
             github_child: None,
+            child_status: None,
+            child_status_for: None,
             readme: None,
             readme_error: None,
             readme_for: None,
@@ -351,6 +355,12 @@ impl Repo {
                 github.clone(),
                 crate::github::web_url(github),
             ));
+            if self.child_status_for.as_deref() == Some(github.as_str())
+                && let Some(status) = &self.child_status
+            {
+                let line = status.line();
+                fields.push(Field::same(FieldId::ChildStatus, "child status", line));
+            }
         }
         if let Some(readme) = &self.readme {
             fields.push(Field::new(
@@ -520,6 +530,29 @@ fn github_line(repo: &Repo) -> Option<String> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChildStatus {
+    Checking,
+    Current,
+    Stale(Vec<String>),
+    Missing,
+    Failed(String),
+}
+
+impl ChildStatus {
+    pub fn line(&self) -> String {
+        match self {
+            Self::Checking => "checking…".to_string(),
+            Self::Current => "up to date".to_string(),
+            Self::Missing => "missing".to_string(),
+            Self::Failed(err) => err.clone(),
+            Self::Stale(names) if names.len() == 1 => format!("not up to date · {}", names[0]),
+            Self::Stale(names) if names.is_empty() => "not up to date".to_string(),
+            Self::Stale(names) => format!("not up to date · {} branches", names.len()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldId {
     Name,
@@ -540,6 +573,7 @@ pub enum FieldId {
     Namespace,
     Github,
     GithubChild,
+    ChildStatus,
     Readme,
     Transition,
 }
@@ -762,6 +796,17 @@ pub struct GithubChildForm {
     pub github: Editor,
     pub visibility: usize,
     pub focus: usize,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyncCommitsForm {
+    pub full_name: String,
+    pub github: String,
+    pub clone_url: String,
+    pub visibility: String,
     pub error: Option<String>,
     pub busy: bool,
     pub generation: u64,
@@ -1203,6 +1248,37 @@ mod tests {
         assert_eq!(field.display, "acme/checkout");
         assert_eq!(field.copy, "https://github.com/acme/checkout");
         assert!(!FieldId::GithubChild.editable());
+    }
+
+    #[test]
+    fn child_status_names_whether_the_github_child_is_current() {
+        let mut repo = repo("acme", "widget");
+        repo.github_child = Some("acme/checkout".to_string());
+        repo.child_status = Some(ChildStatus::Current);
+        repo.child_status_for = Some("acme/checkout".to_string());
+        let field = repo
+            .fields()
+            .into_iter()
+            .find(|field| field.id == FieldId::ChildStatus)
+            .unwrap();
+        assert_eq!(field.label, "child status");
+        assert_eq!(field.display, "up to date");
+        assert_eq!(field.copy, "up to date");
+        assert!(!FieldId::ChildStatus.editable());
+        assert_eq!(
+            ChildStatus::Stale(vec!["main".to_string()]).line(),
+            "not up to date · main"
+        );
+        assert_eq!(
+            ChildStatus::Stale(vec!["main".to_string(), "topic".to_string()]).line(),
+            "not up to date · 2 branches"
+        );
+        repo.child_status_for = Some("acme/other".to_string());
+        assert!(
+            repo.fields()
+                .iter()
+                .all(|field| field.id != FieldId::ChildStatus)
+        );
     }
 
     #[test]
